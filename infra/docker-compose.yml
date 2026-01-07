@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: dae_mongo
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "mongodb://localhost:27017/admin", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  mongo-init:
+    image: mongo:7
+    container_name: dae_mongo_init
+    depends_on:
+      mongo:
+        condition: service_healthy
+    volumes:
+      - ./mongo-rs-init.js:/mongo-rs-init.js:ro
+    command: ["mongosh", "mongodb://mongo:27017/admin", "/mongo-rs-init.js"]
+    restart: "no"
+
+volumes:
+  mongo_data:
