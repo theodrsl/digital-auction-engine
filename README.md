@@ -1,4 +1,4 @@
-# Digital Auction Engine (Crypto Bot Contest v1)
+# Digital Auction Engine
 
 Backend system that replicates the mechanics of **Telegram Gift Auctions** for digital goods:
 - multi-round auction flow
@@ -43,7 +43,6 @@ Backend system that replicates the mechanics of **Telegram Gift Auctions** for d
 - state transitions are atomic (Mongo transactions)
 
 ## Local run
-### 1) Start infra
 ```bash
 cd infra
 docker compose up -d
