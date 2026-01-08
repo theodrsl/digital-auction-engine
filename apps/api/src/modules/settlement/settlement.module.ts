@@ -7,14 +7,17 @@ import { JobsModule } from '../jobs/jobs.module';
 
 import { AllocationModel, AllocationSchema } from './allocation.schema';
 import { SettlementProcessor } from './settlement.processor';
+import { WalletModel, WalletSchema } from '../wallet/wallet.schema';
 
 @Module({
   imports: [
     JobsModule,
     BullModule.registerQueue({ name: QUEUE_SETTLEMENT }),
-    MongooseModule.forFeature([{ name: AllocationModel.name, schema: AllocationSchema }]),
+    MongooseModule.forFeature([
+      { name: AllocationModel.name, schema: AllocationSchema },
+      { name: WalletModel.name, schema: WalletSchema },
+    ]),
   ],
   providers: [SettlementProcessor],
-  exports: [],
 })
 export class SettlementModule {}

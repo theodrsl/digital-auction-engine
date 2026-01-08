@@ -1,16 +1,17 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
-import { Job } from 'bullmq';
-import { InjectConnection } from '@nestjs/mongoose';
-import { Connection } from 'mongoose';
-import { InjectQueue } from '@nestjs/bullmq';
-import { Queue } from 'bullmq';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { Processor, WorkerHost, InjectQueue } from '@nestjs/bullmq';
+import { Job, Queue } from 'bullmq';
+import { InjectConnection, InjectModel } from '@nestjs/mongoose';
+import { Connection, Model } from 'mongoose';
 
-import { QUEUE_ROUND_CLOSE, JOB_CLOSE_ROUND, QUEUE_SETTLEMENT, JOB_SETTLE_ALLOCATION, settleAllocationJobId } from '../jobs/queues';
+import {
+  QUEUE_ROUND_CLOSE,
+  JOB_CLOSE_ROUND,
+  QUEUE_SETTLEMENT,
+  JOB_SETTLE_ALLOCATION,
+  settleAllocationJobId,
+} from '../jobs/queues';
+
 import { AllocationModel, AllocationDocument } from '../settlement/allocation.schema';
-
-// IMPORTANT: подстрой под твой Round schema/model
 import { RoundModel, RoundDocument } from './round.schema';
 import { BidModel, BidDocument } from '../bidding/bid.schema';
 
@@ -30,6 +31,7 @@ export class RoundCloseProcessor extends WorkerHost {
     if (job.name !== JOB_CLOSE_ROUND) return;
 
     const { roundId } = job.data as { roundId: string };
+    if (!roundId) return;
 
     const session = await this.conn.startSession();
     try {
@@ -46,28 +48,53 @@ export class RoundCloseProcessor extends WorkerHost {
           return;
         }
 
-        // TODO: winnersPerRound брать из auction config (пока фикс)
+        // TODO: брать из auction.roundConfig.winnersPerRound
         const winnersPerRound = 10;
 
-        // Snapshot: top bids by auction (и при желании по roundId)
-        const top = await this.bidModel
-          .find({ auctionId: String(round.auctionId) })
+        // IMPORTANT: работаем в рамках текущего roundId (иначе подтягивает ставки из других раундов)
+        // Берём лучший bid на пользователя (т.к. "один активный bid на пользователя" — но лучше не надеяться)
+        // Сортировка: amount desc, lastBidAt asc (раньше при равенстве)
+        const perUserBest = await this.bidModel
+          .find({ roundId: String(round._id) })
           .sort({ amount: -1, lastBidAt: 1 })
-          .limit(winnersPerRound)
-          .session(session);
+          .session(session)
+          .lean();
 
-        // Create allocations (idempotent via uq_allocation_round_user)
-        for (const b of top) {
+        // Дедуп по userId (берём первый из отсортированного списка)
+        const seen = new Set<string>();
+        const bestByUser: Array<{ userId: string; amount: number; currency: string }> = [];
+        for (const b of perUserBest as any[]) {
+          const uid = String(b.userId);
+          if (seen.has(uid)) continue;
+          seen.add(uid);
+          bestByUser.push({ userId: uid, amount: Number(b.amount), currency: String(b.currency) });
+        }
+
+        // Если ставок нет — просто закрываем раунд
+        if (bestByUser.length === 0) {
+          await this.roundModel.updateOne(
+            { _id: round._id },
+            { $set: { status: 'CLOSED', closedAt: new Date() } },
+            { session },
+          );
+          return;
+        }
+
+        const winners = bestByUser.slice(0, winnersPerRound);
+        const losers = bestByUser.slice(winnersPerRound);
+
+        // 1) WIN allocations
+        for (const w of winners) {
           await this.allocationModel.updateOne(
-            { roundId: String(round._id), userId: b.userId },
+            { roundId: String(round._id), userId: w.userId },
             {
               $setOnInsert: {
                 auctionId: String(round.auctionId),
                 roundId: String(round._id),
                 roundNo: round.no,
-                userId: b.userId,
-                currency: b.currency,
-                bidAmount: b.amount,
+                userId: w.userId,
+                currency: w.currency,
+                bidAmount: w.amount,
                 kind: 'WIN',
                 status: 'PENDING',
               },
@@ -76,6 +103,27 @@ export class RoundCloseProcessor extends WorkerHost {
           );
         }
 
+        // 2) CARRY allocations (проигравшие должны получить RELEASE, иначе reserved будет висеть)
+        for (const l of losers) {
+          await this.allocationModel.updateOne(
+            { roundId: String(round._id), userId: l.userId },
+            {
+              $setOnInsert: {
+                auctionId: String(round.auctionId),
+                roundId: String(round._id),
+                roundNo: round.no,
+                userId: l.userId,
+                currency: l.currency,
+                bidAmount: l.amount,
+                kind: 'CARRY',
+                status: 'PENDING',
+              },
+            },
+            { upsert: true, session },
+          );
+        }
+
+        // finalize round
         await this.roundModel.updateOne(
           { _id: round._id },
           { $set: { status: 'CLOSED', closedAt: new Date() } },
@@ -83,9 +131,10 @@ export class RoundCloseProcessor extends WorkerHost {
         );
       });
 
-      // enqueue settlement OUTSIDE tx
-      const allocations = await this.allocationModel.find({ roundId: String(roundId), kind: 'WIN' }).lean();
-      for (const a of allocations) {
+      // enqueue settlement OUTSIDE tx (idempotent via jobId + settlement processor entryKey)
+      const allocations = await this.allocationModel.find({ roundId: String(roundId) }).lean();
+
+      for (const a of allocations as any[]) {
         await this.settlementQueue.add(
           JOB_SETTLE_ALLOCATION,
           { allocationId: String(a._id) },
