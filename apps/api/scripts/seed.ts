@@ -1,98 +1,96 @@
-import 'dotenv/config';
-import mongoose, { Schema } from 'mongoose';
+/* eslint-disable no-console */
+require('dotenv/config');
+
+const mongoose = require('mongoose');
 
 async function main() {
-  const uri = process.env.MONGO_URI!;
-  const dbName = process.env.MONGO_DB ?? 'digital_auction';
-  if (!uri) throw new Error('MONGO_URI missing');
+  const uri = process.env.MONGO_URI || 'mongodb://localhost:27017';
+  const dbName = process.env.MONGO_DB || 'digital_auction';
 
   await mongoose.connect(uri, { dbName });
 
-  const RoundSchema = new Schema(
-    {
-      auctionId: { type: Schema.Types.ObjectId, required: true, index: true },
-      no: { type: Number, required: true },
-      status: { type: String, required: true },
-      startAt: { type: Date, required: true },
-      endAt: { type: Date, required: true },
-      antiSnipe: { totalExtendedSec: { type: Number, required: true, default: 0 } },
-    },
-    { collection: 'rounds', timestamps: true },
-  );
-
-  const WalletSchema = new Schema(
-    {
-      userId: { type: String, required: true },
-      currency: { type: String, required: true },
-      available: { type: Number, required: true, default: 0 },
-      reserved: { type: Number, required: true, default: 0 },
-      version: { type: Number, required: true, default: 0 },
-    },
-    { collection: 'wallets', timestamps: true },
-  );
-
-  const LedgerSchema = new Schema(
-    {
-      entryKey: { type: String, required: true, unique: true },
-      userId: { type: String, required: true },
-      currency: { type: String, required: true },
-      type: { type: String, required: true },
-      amount: { type: Number, required: true },
-      from: { type: String, required: true },
-      to: { type: String, required: true },
-    },
-    { collection: 'ledger_entries', timestamps: { createdAt: true, updatedAt: false } },
-  );
-
-  const Round = mongoose.model('Round', RoundSchema);
-  const Wallet = mongoose.model('Wallet', WalletSchema);
-  const Ledger = mongoose.model('Ledger', LedgerSchema);
+  const Auction = mongoose.connection.collection('auctions');
+  const Round = mongoose.connection.collection('rounds');
+  const Wallets = mongoose.connection.collection('wallets');
+  const Ledger = mongoose.connection.collection('ledger_entries');
 
   const auctionId = new mongoose.Types.ObjectId();
-  const now = new Date();
+  const roundId = new mongoose.Types.ObjectId();
 
-  const round = await Round.create({
-    auctionId,
+  const now = new Date();
+  const endAt = new Date(now.getTime() + 60_000);
+
+  await Auction.insertOne({
+    _id: auctionId,
+    currency: 'TON',
+    status: 'LIVE',
+    activeRoundId: roundId.toString(),
+    activeRoundNo: 1,
+    roundConfig: {
+      roundDurationSec: 60,
+      winnersPerRound: 10,
+      maxRounds: 100,
+      antiSnipe: { windowSec: 10, extendSec: 10, maxTotalExtendSec: 120 },
+    },
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  await Round.insertOne({
+    _id: roundId,
+    auctionId: auctionId.toString(),
     no: 1,
     status: 'OPEN',
     startAt: now,
-    endAt: new Date(now.getTime() + 60_000),
+    endAt,
     antiSnipe: { totalExtendedSec: 0 },
+    createdAt: now,
+    updatedAt: now,
   });
 
   const userId = 'u1';
   const currency = 'TON';
-  const credit = 10_000;
 
-  await Wallet.updateOne(
+  await Wallets.updateOne(
     { userId, currency },
-    { $setOnInsert: { userId, currency, available: 0, reserved: 0, version: 0 } },
+    {
+      $setOnInsert: {
+        userId,
+        currency,
+        available: 10000,
+        reserved: 0,
+        version: 0,
+        createdAt: now,
+      },
+      $set: { updatedAt: now },
+    },
     { upsert: true },
   );
 
-  const entryKey = `seed:credit:${userId}:${Date.now()}`;
-  await Ledger.create({
-    entryKey,
+  await Ledger.insertOne({
+    entryKey: `seed:credit:${userId}:${Date.now()}`,
     userId,
     currency,
     type: 'CREDIT',
-    amount: credit,
+    amount: 10000,
     from: 'EXTERNAL',
     to: 'AVAILABLE',
+    createdAt: now,
   });
-
-  await Wallet.updateOne({ userId, currency }, { $inc: { available: credit, version: 1 } });
 
   console.log('Seed OK');
   console.log('auctionId:', auctionId.toString());
-  console.log('roundId:', round._id.toString());
+  console.log('roundId:', roundId.toString());
   console.log('userId:', userId);
   console.log('currency:', currency);
 
   await mongoose.disconnect();
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
   console.error(e);
+  try {
+    await mongoose.disconnect();
+  } catch {}
   process.exit(1);
 });
