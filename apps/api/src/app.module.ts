@@ -6,6 +6,7 @@ import { RoundModule } from './modules/round/round.module';
 import { BiddingModule } from './modules/bidding/bidding.module';
 import { JobsModule } from './modules/jobs/jobs.module';
 import { SettlementModule } from './modules/settlement/settlement.module';
+import { AuctionModule } from './modules/auction/auction.module';
 
 @Module({
   imports: [
@@ -22,6 +23,8 @@ import { SettlementModule } from './modules/settlement/settlement.module';
     WalletModule,
     RoundModule,
     BiddingModule,
+
+    AuctionModule,
   ],
 })
 export class AppModule {}

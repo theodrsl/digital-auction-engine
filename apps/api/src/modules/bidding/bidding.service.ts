@@ -1,4 +1,9 @@
-import { BadRequestException, Injectable, InternalServerErrorException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  InternalServerErrorException,
+  HttpException,
+} from '@nestjs/common';
 import { InjectConnection } from '@nestjs/mongoose';
 import { ClientSession, Connection } from 'mongoose';
 
@@ -48,14 +53,16 @@ export class BiddingService {
       return await this.conn.transaction(async (session: ClientSession) => {
         const round = await this.roundService.assertOpenRound({ auctionId, roundId }, session);
 
-        // idem
+        // idempotency
         const existingEvent = await this.bidEventRepo.findByIdempotency(
           { auctionId, userId, idempotencyKey },
           session,
         );
         if (existingEvent) {
+          const active = await this.bidRepo.findActive({ auctionId, userId }, session);
+
           return {
-            bidId: '',
+            bidId: active ? String(active._id) : '',
             prevAmount: existingEvent.prevAmount,
             newAmount: existingEvent.amount,
             delta: existingEvent.delta,
@@ -115,6 +122,9 @@ export class BiddingService {
         };
       });
     } catch (e: any) {
+      // Preserve meaningful HTTP errors
+      if (e instanceof HttpException) throw e;
+
       throw new InternalServerErrorException(e?.message ?? 'Internal server error');
     }
   }
