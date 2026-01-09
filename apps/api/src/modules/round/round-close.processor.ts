@@ -43,18 +43,23 @@ export class RoundCloseProcessor extends WorkerHost {
           { new: true, session },
         );
 
-        if (!round) {
-          // already closing/closed
-          return;
-        }
+        if (!round) return; // already closing/closed
 
-        // TODO: брать из auction.roundConfig.winnersPerRound
-        const winnersPerRound = 10;
+        // winnersPerRound: берём из auction.roundConfig
+        const auctionsCol = this.conn.collection('auctions');
+        const auction = await auctionsCol.findOne(
+          { _id: round.auctionId as any },
+          { session },
+        );
 
-        // IMPORTANT: работаем в рамках текущего roundId (иначе подтягивает ставки из других раундов)
-        // Берём лучший bid на пользователя (т.к. "один активный bid на пользователя" — но лучше не надеяться)
+        const winnersPerRound = Math.max(
+          1,
+          Number((auction as any)?.roundConfig?.winnersPerRound ?? 10),
+        );
+
+        // IMPORTANT: только текущий roundId
         // Сортировка: amount desc, lastBidAt asc (раньше при равенстве)
-        const perUserBest = await this.bidModel
+        const bidsSorted = await this.bidModel
           .find({ roundId: String(round._id) })
           .sort({ amount: -1, lastBidAt: 1 })
           .session(session)
@@ -63,14 +68,18 @@ export class RoundCloseProcessor extends WorkerHost {
         // Дедуп по userId (берём первый из отсортированного списка)
         const seen = new Set<string>();
         const bestByUser: Array<{ userId: string; amount: number; currency: string }> = [];
-        for (const b of perUserBest as any[]) {
+        for (const b of bidsSorted as any[]) {
           const uid = String(b.userId);
           if (seen.has(uid)) continue;
           seen.add(uid);
-          bestByUser.push({ userId: uid, amount: Number(b.amount), currency: String(b.currency) });
+          bestByUser.push({
+            userId: uid,
+            amount: Number(b.amount),
+            currency: String(b.currency),
+          });
         }
 
-        // Если ставок нет — просто закрываем раунд
+        // Если ставок нет — просто закрываем
         if (bestByUser.length === 0) {
           await this.roundModel.updateOne(
             { _id: round._id },
@@ -103,7 +112,7 @@ export class RoundCloseProcessor extends WorkerHost {
           );
         }
 
-        // 2) CARRY allocations (проигравшие должны получить RELEASE, иначе reserved будет висеть)
+        // 2) CARRY allocations (проигравшие должны получить RELEASE)
         for (const l of losers) {
           await this.allocationModel.updateOne(
             { roundId: String(round._id), userId: l.userId },
@@ -131,7 +140,7 @@ export class RoundCloseProcessor extends WorkerHost {
         );
       });
 
-      // enqueue settlement OUTSIDE tx (idempotent via jobId + settlement processor entryKey)
+      // enqueue settlement OUTSIDE tx (idempotent via jobId + settlement entryKey)
       const allocations = await this.allocationModel.find({ roundId: String(roundId) }).lean();
 
       for (const a of allocations as any[]) {

@@ -42,6 +42,11 @@ export class AuctionController {
     return this.service.start(id);
   }
 
+  @Post(':id/finish')
+  finish(@Param('id') id: string) {
+    return this.service.finish(id);
+  }
+
   // GET /auctions/:id
   @Get(':id')
   get(@Param('id') id: string) {

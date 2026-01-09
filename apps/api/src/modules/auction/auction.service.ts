@@ -195,14 +195,19 @@ export class AuctionService {
    * Поэтому матчим оба варианта.
    */
   async leaderboard(auctionId: string, limit = 20) {
+    const auction = await this.auctions.findById(auctionId).lean();
+    if (!auction) throw new NotFoundException('Auction not found');
+
     const bidsCol = this.conn.collection('bids');
     const capped = Math.min(Math.max(limit ?? 20, 1), 200);
 
     const auctionObjectId = asObjectIdOrNull(auctionId);
+    const roundId = auction.activeRoundId;
 
     const match: any = {
       status: { $in: ['ACTIVE', null] },
       $or: [{ auctionId: auctionId }],
+      $and: [{ roundId: roundId }],
     };
 
     if (auctionObjectId) match.$or.push({ auctionId: auctionObjectId });
@@ -214,8 +219,22 @@ export class AuctionService {
       .limit(capped)
       .toArray();
 
-    return { auctionId, items: rows };
+    return { auctionId, roundId, items: rows };
   }
+
+  async finish(auctionId: string) {
+    const res = await this.auctions.updateOne(
+      { _id: new Types.ObjectId(auctionId) },
+      { $set: { status: 'FINISHED' } },
+    );
+
+    if (res.matchedCount !== 1) {
+      throw new NotFoundException('Auction not found');
+    }
+
+    return this.getById(auctionId);
+  }
+
 
   private async ensureRoundCloseJob(roundId: string, endAt: Date) {
     const delayMs = Math.max(0, endAt.getTime() - Date.now());

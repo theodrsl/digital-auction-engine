@@ -9,6 +9,8 @@ import { AllocationModel, AllocationSchema } from './allocation.schema';
 import { SettlementProcessor } from './settlement.processor';
 import { WalletModel, WalletSchema } from '../wallet/wallet.schema';
 
+import { LedgerEntryModel, LedgerEntrySchema } from '../wallet/ledger.schema';
+
 @Module({
   imports: [
     JobsModule,
@@ -16,6 +18,7 @@ import { WalletModel, WalletSchema } from '../wallet/wallet.schema';
     MongooseModule.forFeature([
       { name: AllocationModel.name, schema: AllocationSchema },
       { name: WalletModel.name, schema: WalletSchema },
+      { name: LedgerEntryModel.name, schema: LedgerEntrySchema },
     ]),
   ],
   providers: [SettlementProcessor],
