@@ -8,12 +8,15 @@ import {
   JOB_CLOSE_ROUND,
   QUEUE_SETTLEMENT,
   JOB_SETTLE_ALLOCATION,
-  settleAllocationJobId,
 } from '../jobs/queues';
 
 import { AllocationModel, AllocationDocument } from '../settlement/allocation.schema';
 import { RoundModel, RoundDocument } from './round.schema';
 import { BidModel, BidDocument } from '../bidding/bid.schema';
+
+function settleJobId(roundId: string, userId: string) {
+  return `settle:${roundId}:${userId}`;
+}
 
 @Processor(QUEUE_ROUND_CLOSE)
 export class RoundCloseProcessor extends WorkerHost {
@@ -33,131 +36,129 @@ export class RoundCloseProcessor extends WorkerHost {
     const { roundId } = job.data as { roundId: string };
     if (!roundId) return;
 
-    const session = await this.conn.startSession();
-    try {
-      await session.withTransaction(async () => {
-        // CAS: OPEN -> CLOSING
-        const round = await this.roundModel.findOneAndUpdate(
-          { _id: roundId, status: 'OPEN' },
-          { $set: { status: 'CLOSING' } },
-          { new: true, session },
-        );
+    const round = await this.roundModel.findOneAndUpdate(
+      { _id: roundId, status: 'OPEN' },
+      { $set: { status: 'CLOSING' } },
+      { new: true },
+    );
 
-        if (!round) return; // already closing/closed
+    if (!round) return;
 
-        // winnersPerRound: берём из auction.roundConfig
-        const auctionsCol = this.conn.collection('auctions');
-        const auction = await auctionsCol.findOne(
-          { _id: round.auctionId as any },
-          { session },
-        );
+    const auctionsCol = this.conn.collection('auctions');
+    const auction = await auctionsCol.findOne({ _id: round.auctionId as any });
 
-        const winnersPerRound = Math.max(
-          1,
-          Number((auction as any)?.roundConfig?.winnersPerRound ?? 10),
-        );
+    const winnersPerRound = Math.max(
+      1,
+      Number((auction as any)?.roundConfig?.winnersPerRound ?? 10),
+    );
 
-        // IMPORTANT: только текущий roundId
-        // Сортировка: amount desc, lastBidAt asc (раньше при равенстве)
-        const bidsSorted = await this.bidModel
-          .find({ roundId: String(round._id) })
-          .sort({ amount: -1, lastBidAt: 1 })
-          .session(session)
-          .lean();
+    const pipeline: any[] = [
+      { $match: { roundId: String(round._id) } },
+      { $sort: { amount: -1, lastBidAt: 1 } },
+      {
+        $group: {
+          _id: '$userId',
+          userId: { $first: '$userId' },
+          amount: { $first: '$amount' },
+          currency: { $first: '$currency' },
+          lastBidAt: { $first: '$lastBidAt' },
+        },
+      },
+      { $sort: { amount: -1, lastBidAt: 1 } },
+      {
+        $setWindowFields: {
+          sortBy: { amount: -1, lastBidAt: 1 },
+          output: { rank: { $rank: {} } },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          userId: 1,
+          amount: 1,
+          currency: 1,
+          rank: 1,
+        },
+      },
+    ];
 
-        // Дедуп по userId (берём первый из отсортированного списка)
-        const seen = new Set<string>();
-        const bestByUser: Array<{ userId: string; amount: number; currency: string }> = [];
-        for (const b of bidsSorted as any[]) {
-          const uid = String(b.userId);
-          if (seen.has(uid)) continue;
-          seen.add(uid);
-          bestByUser.push({
-            userId: uid,
-            amount: Number(b.amount),
-            currency: String(b.currency),
-          });
-        }
+    const cursor = this.bidModel
+      .aggregate(pipeline, { allowDiskUse: true })
+      .cursor({ batchSize: 1000 });
 
-        // Если ставок нет — просто закрываем
-        if (bestByUser.length === 0) {
-          await this.roundModel.updateOne(
-            { _id: round._id },
-            { $set: { status: 'CLOSED', closedAt: new Date() } },
-            { session },
-          );
-          return;
-        }
+    const allocOps: any[] = [];
+    const jobOps: any[] = [];
 
-        const winners = bestByUser.slice(0, winnersPerRound);
-        const losers = bestByUser.slice(winnersPerRound);
+    const flush = async () => {
+      if (allocOps.length) {
+        await this.allocationModel.bulkWrite(allocOps, { ordered: false });
+        allocOps.length = 0;
+      }
+      if (jobOps.length) {
+        await this.settlementQueue.addBulk(jobOps.splice(0, jobOps.length));
+      }
+    };
 
-        // 1) WIN allocations
-        for (const w of winners) {
-          await this.allocationModel.updateOne(
-            { roundId: String(round._id), userId: w.userId },
-            {
-              $setOnInsert: {
-                auctionId: String(round.auctionId),
-                roundId: String(round._id),
-                roundNo: round.no,
-                userId: w.userId,
-                currency: w.currency,
-                bidAmount: w.amount,
-                kind: 'WIN',
-                status: 'PENDING',
-              },
+    let any = false;
+
+    for await (const row of cursor as any) {
+      any = true;
+
+      const userId = String(row.userId);
+      const currency = String(row.currency);
+      const bidAmount = Math.max(0, Number(row.amount ?? 0));
+      const finalAmount = bidAmount;
+
+      const isWin = Number(row.rank ?? 0) <= winnersPerRound;
+      const kind = isWin ? 'WIN' : 'CARRY';
+
+      allocOps.push({
+        updateOne: {
+          filter: { roundId: String(round._id), userId },
+          update: {
+            $setOnInsert: {
+              auctionId: String(round.auctionId),
+              roundId: String(round._id),
+              roundNo: round.no,
+              userId,
+              currency,
+              status: 'PENDING',
             },
-            { upsert: true, session },
-          );
-        }
-
-        // 2) CARRY allocations (проигравшие должны получить RELEASE)
-        for (const l of losers) {
-          await this.allocationModel.updateOne(
-            { roundId: String(round._id), userId: l.userId },
-            {
-              $setOnInsert: {
-                auctionId: String(round.auctionId),
-                roundId: String(round._id),
-                roundNo: round.no,
-                userId: l.userId,
-                currency: l.currency,
-                bidAmount: l.amount,
-                kind: 'CARRY',
-                status: 'PENDING',
-              },
+            $set: {
+              currency,
+              bidAmount,
+              finalAmount,
+              kind,
             },
-            { upsert: true, session },
-          );
-        }
-
-        // finalize round
-        await this.roundModel.updateOne(
-          { _id: round._id },
-          { $set: { status: 'CLOSED', closedAt: new Date() } },
-          { session },
-        );
+          },
+          upsert: true,
+        },
       });
 
-      // enqueue settlement OUTSIDE tx (idempotent via jobId + settlement entryKey)
-      const allocations = await this.allocationModel.find({ roundId: String(roundId) }).lean();
+      jobOps.push({
+        name: JOB_SETTLE_ALLOCATION,
+        data: { roundId: String(round._id), userId },
+        opts: {
+          jobId: settleJobId(String(round._id), userId),
+          removeOnComplete: true,
+          removeOnFail: 500,
+          attempts: 10,
+          backoff: { type: 'exponential', delay: 1000 },
+        },
+      });
 
-      for (const a of allocations as any[]) {
-        await this.settlementQueue.add(
-          JOB_SETTLE_ALLOCATION,
-          { allocationId: String(a._id) },
-          {
-            jobId: settleAllocationJobId(String(a._id)),
-            removeOnComplete: true,
-            removeOnFail: 500,
-            attempts: 10,
-            backoff: { type: 'exponential', delay: 1000 },
-          },
-        );
+      if (allocOps.length >= 1000) {
+        await flush();
       }
-    } finally {
-      await session.endSession();
     }
+
+    await flush();
+
+    await this.roundModel.updateOne(
+      { _id: round._id, status: 'CLOSING' },
+      { $set: { status: 'CLOSED', closedAt: new Date() } },
+    );
+
+    if (!any) return;
   }
 }

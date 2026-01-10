@@ -26,6 +26,9 @@ export class AllocationModel {
   @Prop({ required: true, min: 0 })
   bidAmount!: number;
 
+  @Prop({ required: true, min: 0 })
+  finalAmount!: number;
+
   @Prop({ required: true, enum: ['WIN', 'CARRY'] })
   kind!: AllocationKind;
 

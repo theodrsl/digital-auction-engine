@@ -16,3 +16,7 @@ out
 
 coverage
 tmp
+
+**/src/**/*.js
+**/src/**/*.js.map
+**/src/**/*.d.ts

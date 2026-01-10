@@ -7,16 +7,8 @@ import { QUEUE_SETTLEMENT, JOB_SETTLE_ALLOCATION } from '../jobs/queues';
 import { AllocationDocument, AllocationModel } from './allocation.schema';
 import { WalletDocument, WalletModel } from '../wallet/wallet.schema';
 import { LedgerEntryDocument, LedgerEntryModel } from '../wallet/ledger.schema';
-
-type BidLike = {
-  userId: string;
-  roundId: string;
-  auctionId?: any;
-  amount: number;
-  currency: string;
-  status?: string | null;
-  lastBidAt?: Date;
-};
+import { DeliveryDocument, DeliveryModel } from './delivery.schema';
+import { AuctionDocument, AuctionModel } from '../auction/auction.schema';
 
 @Processor(QUEUE_SETTLEMENT)
 export class SettlementProcessor extends WorkerHost {
@@ -25,143 +17,182 @@ export class SettlementProcessor extends WorkerHost {
     @InjectModel(AllocationModel.name) private readonly allocationModel: Model<AllocationDocument>,
     @InjectModel(WalletModel.name) private readonly walletModel: Model<WalletDocument>,
     @InjectModel(LedgerEntryModel.name) private readonly ledgerModel: Model<LedgerEntryDocument>,
+    @InjectModel(DeliveryModel.name) private readonly deliveryModel: Model<DeliveryDocument>,
+    @InjectModel(AuctionModel.name) private readonly auctionModel: Model<AuctionDocument>,
   ) {
     super();
+  }
+
+  private async deliverPrizeOnce(params: {
+    allocationId: string;
+    auctionId: string;
+    roundId: string;
+    userId: string;
+  }) {
+    const { allocationId, auctionId, roundId, userId } = params;
+
+    const auction = await this.auctionModel.findById(auctionId).lean();
+    const item = (auction as any)?.item;
+
+    const itemKind = String(item?.kind || 'TELEGRAM_GIFT');
+    const itemName = String(item?.name || 'Limited Gift');
+    const itemCollection = item?.collection ? String(item.collection) : undefined;
+
+    const totalSupply = Number(item?.totalSupply ?? 0);
+    const key = `deliver:${allocationId}`;
+
+    const delivery = await this.deliveryModel.findOneAndUpdate(
+      { deliveryKey: key },
+      {
+        $setOnInsert: {
+          deliveryKey: key,
+          auctionId,
+          roundId,
+          allocationId,
+          userId,
+          itemKind,
+          itemName,
+          itemCollection,
+          units: 1,
+          status: 'CREATING',
+        },
+      },
+      { upsert: true, new: true },
+    );
+
+    if (!delivery) return;
+
+    const status = String((delivery as any).status || '');
+    const supplySeqExisting = (delivery as any).supplySeq;
+
+    if (status === 'DELIVERED') return;
+
+    if (Number.isFinite(supplySeqExisting) && Number(supplySeqExisting) > 0) {
+      await this.deliveryModel.updateOne(
+        { deliveryKey: key, status: { $ne: 'DELIVERED' } },
+        { $set: { status: 'DELIVERED' }, $unset: { failReason: 1 } },
+      );
+      return;
+    }
+
+    let seq = 0;
+
+    if (Number.isFinite(totalSupply) && totalSupply > 0) {
+      const res = await this.auctionModel.findOneAndUpdate(
+        { _id: auctionId, distributedSupply: { $lt: totalSupply } },
+        { $inc: { distributedSupply: 1 } },
+        { new: true },
+      );
+
+      if (!res) {
+        await this.deliveryModel.updateOne(
+          { deliveryKey: key, status: { $ne: 'DELIVERED' } },
+          { $set: { status: 'FAILED_SUPPLY', failReason: `supply exhausted totalSupply=${totalSupply}` } },
+        );
+        throw new Error(`[delivery] supply exhausted auction=${auctionId} totalSupply=${totalSupply}`);
+      }
+
+      seq = Number((res as any).distributedSupply ?? 0);
+    } else {
+      const res2 = await this.auctionModel.findOneAndUpdate(
+        { _id: auctionId },
+        { $inc: { distributedSupply: 1 } },
+        { new: true },
+      );
+      seq = Number((res2 as any)?.distributedSupply ?? 0);
+    }
+
+    await this.deliveryModel.updateOne(
+      { deliveryKey: key, status: { $ne: 'DELIVERED' }, supplySeq: { $exists: false } },
+      { $set: { supplySeq: seq, status: 'DELIVERED' }, $unset: { failReason: 1 } },
+    );
+
+    await this.deliveryModel.updateOne(
+      { deliveryKey: key, status: { $ne: 'DELIVERED' }, supplySeq: { $exists: true } },
+      { $set: { status: 'DELIVERED' }, $unset: { failReason: 1 } },
+    );
   }
 
   async process(job: Job): Promise<any> {
     if (job.name !== JOB_SETTLE_ALLOCATION) return;
 
-    const { allocationId } = job.data as { allocationId: string };
-    if (!allocationId) return;
+    const { roundId, userId } = job.data as { roundId: string; userId: string };
+    if (!roundId || !userId) return;
 
-    const session = await this.conn.startSession();
+    const allocation = await this.allocationModel.findOneAndUpdate(
+      { roundId: String(roundId), userId: String(userId), status: { $in: ['PENDING', 'FAILED'] } },
+      { $set: { status: 'SETTLING' } },
+      { new: true },
+    );
+
+    if (!allocation) return;
+
+    const allocationId = allocation._id.toString();
+
     try {
-      await session.withTransaction(async () => {
-        const allocation = await this.allocationModel.findById(allocationId).session(session);
-        if (!allocation) return;
-        if (allocation.status === 'SETTLED') return;
+      const finalAmount = Math.max(0, Number((allocation as any).finalAmount ?? 0));
+      const op = allocation.kind === 'WIN' ? 'CAPTURE' : 'RELEASE';
+      const entryKey = `settle:${allocationId}:${op}`;
 
-        // best-effort lock
-        if (allocation.status === 'PENDING') {
-          allocation.status = 'SETTLING';
-          await allocation.save({ session });
-        }
-
-        // 1) Read current wallet snapshot (we must never "capture" more than wallet.reserved)
-        const wallet = await this.walletModel
-          .findOne({ userId: allocation.userId, currency: allocation.currency })
-          .session(session);
-
-        if (!wallet) {
-          throw new Error(
-            `[settlement] wallet not found user=${allocation.userId} currency=${allocation.currency}`,
-          );
-        }
-
-        // 2) Determine settle amount from CURRENT bid state (delta-reserve model)
-        // Prefer ACTIVE bid for this round+user. If your bids don't have status, it will still find latest by amount/lastBidAt.
-        const bidsCol = this.conn.collection<BidLike>('bids');
-
-        const bid = await bidsCol
-          .find({
+      if (finalAmount > 0) {
+        try {
+          await this.ledgerModel.create({
+            entryKey,
             userId: allocation.userId,
-            roundId: allocation.roundId,
             currency: allocation.currency,
-            status: { $in: ['ACTIVE', null] },
-          })
-          .sort({ amount: -1, lastBidAt: 1 })
-          .limit(1)
-          .toArray();
-
-        const bidAmount = Number(bid?.[0]?.amount ?? 0);
-
-        // allocation.bidAmount = amount snapshot at close time (winner/loser best bid)
-        const allocationAmount = Number(allocation.bidAmount ?? 0);
-
-        // Candidate = prefer bidAmount if present else allocationAmount
-        const candidate = bidAmount > 0 ? bidAmount : allocationAmount;
-
-        // CRITICAL: never try to move more than current wallet.reserved
-        const settleAmount = Math.max(0, Math.min(Number(wallet.reserved ?? 0), candidate));
-
-        const op = allocation.kind === 'WIN' ? 'CAPTURE' : 'RELEASE';
-        const entryKey = `settle:${allocation._id.toString()}:${op}`;
-
-        // If nothing reserved now => settle as no-op (idempotent), mark SETTLED
-        if (settleAmount > 0) {
-          // 3) ledger (idempotent by unique entryKey)
-          try {
-            await this.ledgerModel.create(
-              [
-                {
-                  entryKey,
-                  userId: allocation.userId,
-                  currency: allocation.currency,
-                  type: op,
-                  amount: settleAmount,
-                  from: 'RESERVED',
-                  to: allocation.kind === 'WIN' ? 'SINK' : 'AVAILABLE',
-                  auctionId: allocation.auctionId,
-                  roundId: allocation.roundId,
-                  meta: {
-                    allocationId: allocation._id.toString(),
-                    allocationKind: allocation.kind,
-                    bidAmount,
-                    allocationAmount,
-                    walletReservedAtSettle: Number(wallet.reserved ?? 0),
-                    at: new Date().toISOString(),
-                  },
-                },
-              ],
-              { session },
-            );
-          } catch (e: any) {
-            if (String(e?.code) !== '11000') throw e;
-            // already have ledger entry => proceed to wallet move (may have been rolled back earlier, but ok)
-          }
-
-          // 4) wallet move (CAS)
-          if (allocation.kind === 'WIN') {
-            const res = await this.walletModel.updateOne(
-              {
-                userId: allocation.userId,
-                currency: allocation.currency,
-                reserved: { $gte: settleAmount },
-              },
-              { $inc: { reserved: -settleAmount, version: 1 } },
-              { session },
-            );
-
-            if (res.modifiedCount !== 1) {
-              throw new Error(
-                `[settlement] CAPTURE wallet move failed user=${allocation.userId} round=${allocation.roundId} amount=${settleAmount}`,
-              );
-            }
-          } else {
-            const res = await this.walletModel.updateOne(
-              {
-                userId: allocation.userId,
-                currency: allocation.currency,
-                reserved: { $gte: settleAmount },
-              },
-              { $inc: { reserved: -settleAmount, available: settleAmount, version: 1 } },
-              { session },
-            );
-
-            if (res.modifiedCount !== 1) {
-              throw new Error(
-                `[settlement] RELEASE wallet move failed user=${allocation.userId} round=${allocation.roundId} amount=${settleAmount}`,
-              );
-            }
-          }
+            type: op,
+            amount: finalAmount,
+            from: 'RESERVED',
+            to: allocation.kind === 'WIN' ? 'SINK' : 'AVAILABLE',
+            auctionId: allocation.auctionId,
+            roundId: allocation.roundId,
+            meta: {
+              allocationId,
+              allocationKind: allocation.kind,
+              finalAmount,
+              at: new Date().toISOString(),
+            },
+          });
+        } catch (e: any) {
+          if (String(e?.code) !== '11000') throw e;
         }
 
-        // 5) finalize allocation
-        allocation.status = 'SETTLED';
-        allocation.settlementId = allocation.settlementId ?? `settle:${allocation._id.toString()}`;
-        await allocation.save({ session });
-      });
+        if (allocation.kind === 'WIN') {
+          const res = await this.walletModel.updateOne(
+            { userId: allocation.userId, currency: allocation.currency, reserved: { $gte: finalAmount } },
+            { $inc: { reserved: -finalAmount, version: 1 } },
+          );
+          if (res.modifiedCount !== 1) {
+            throw new Error(
+              `[settlement] CAPTURE wallet move failed user=${allocation.userId} round=${allocation.roundId} amount=${finalAmount}`,
+            );
+          }
+        } else {
+          const res = await this.walletModel.updateOne(
+            { userId: allocation.userId, currency: allocation.currency, reserved: { $gte: finalAmount } },
+            { $inc: { reserved: -finalAmount, available: finalAmount, version: 1 } },
+          );
+          if (res.modifiedCount !== 1) {
+            throw new Error(
+              `[settlement] RELEASE wallet move failed user=${allocation.userId} round=${allocation.roundId} amount=${finalAmount}`,
+            );
+          }
+        }
+      }
+
+      if (allocation.kind === 'WIN') {
+        await this.deliverPrizeOnce({
+          allocationId,
+          auctionId: String(allocation.auctionId),
+          roundId: String(allocation.roundId),
+          userId: String(allocation.userId),
+        });
+      }
+
+      await this.allocationModel.updateOne(
+        { _id: allocation._id, status: 'SETTLING' },
+        { $set: { status: 'SETTLED', settlementId: (allocation as any).settlementId ?? `settle:${allocationId}` } },
+      );
     } catch (e) {
       try {
         await this.allocationModel.updateOne(
@@ -170,13 +201,9 @@ export class SettlementProcessor extends WorkerHost {
         );
       } catch (_) {}
       throw e;
-    } finally {
-      await session.endSession();
     }
   }
 
   @OnWorkerEvent('failed')
-  onFailed(job: Job, err: Error) {
-    // console.error(`[settlement] failed job=${job.id} name=${job.name}`, err);
-  }
+  onFailed(job: Job, err: Error) {}
 }

@@ -4,7 +4,12 @@ import { Connection, Model, Types } from 'mongoose';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 
-import { AuctionModel, AuctionDocument, AuctionStatus } from './auction.schema';
+import {
+  AuctionModel,
+  AuctionDocument,
+  AuctionStatus,
+  AuctionItemKind,
+} from './auction.schema';
 import { CreateAuctionDto } from './dto/create-auction.dto';
 
 // IMPORTANT: keep jobId without ":" (BullMQ restriction)
@@ -21,6 +26,13 @@ type ListParams = {
 
 function asObjectIdOrNull(id: string): Types.ObjectId | null {
   return Types.ObjectId.isValid(id) ? new Types.ObjectId(id) : null;
+}
+
+function computeDefaultTotalSupply(dto: CreateAuctionDto) {
+  const w = Number(dto.winnersPerRound ?? 0);
+  const r = Number(dto.maxRounds ?? 0);
+  const v = w * r;
+  return Number.isFinite(v) && v > 0 ? v : 1;
 }
 
 @Injectable()
@@ -46,6 +58,19 @@ export class AuctionService {
 
     const roundsCol = this.conn.collection('rounds');
 
+    // --- PRIZE ITEM (gift/NFT) ---
+    const totalSupply =
+      dto.item?.totalSupply && dto.item.totalSupply > 0
+        ? dto.item.totalSupply
+        : computeDefaultTotalSupply(dto);
+
+    const item = {
+      kind: (dto.item?.kind ?? 'TELEGRAM_GIFT') as AuctionItemKind,
+      name: String(dto.item?.name ?? 'Limited Gift'),
+      collection: dto.item?.collection ? String(dto.item.collection) : undefined,
+      totalSupply,
+    };
+
     await this.conn.transaction(async (session) => {
       await this.auctions.create(
         [
@@ -65,6 +90,10 @@ export class AuctionService {
                 maxTotalExtendSec: dto.antiSnipe.maxTotalExtendSec,
               },
             },
+
+            // NEW:
+            item,
+            distributedSupply: 0,
           },
         ],
         { session },
@@ -112,13 +141,17 @@ export class AuctionService {
       .lean();
 
     return {
-      items: rows.map((a) => ({
+      items: rows.map((a: any) => ({
         id: a._id.toString(),
         currency: a.currency,
         status: a.status,
         activeRoundId: a.activeRoundId,
         activeRoundNo: a.activeRoundNo,
         roundConfig: a.roundConfig,
+
+        // NEW:
+        item: a.item ?? null,
+        distributedSupply: Number(a.distributedSupply ?? 0),
       })),
       page: { skip, limit },
     };
@@ -156,7 +189,7 @@ export class AuctionService {
   }
 
   async getById(auctionId: string) {
-    const auction = await this.auctions.findById(auctionId).lean();
+    const auction: any = await this.auctions.findById(auctionId).lean();
     if (!auction) throw new NotFoundException('Auction not found');
 
     const roundsCol = this.conn.collection('rounds');
@@ -171,6 +204,10 @@ export class AuctionService {
         activeRoundId: auction.activeRoundId,
         activeRoundNo: auction.activeRoundNo,
         roundConfig: auction.roundConfig,
+
+        // NEW:
+        item: auction.item ?? null,
+        distributedSupply: Number(auction.distributedSupply ?? 0),
       },
       activeRound: round
         ? {
@@ -202,7 +239,7 @@ export class AuctionService {
     const capped = Math.min(Math.max(limit ?? 20, 1), 200);
 
     const auctionObjectId = asObjectIdOrNull(auctionId);
-    const roundId = auction.activeRoundId;
+    const roundId = (auction as any).activeRoundId;
 
     const match: any = {
       status: { $in: ['ACTIVE', null] },
@@ -234,7 +271,6 @@ export class AuctionService {
 
     return this.getById(auctionId);
   }
-
 
   private async ensureRoundCloseJob(roundId: string, endAt: Date) {
     const delayMs = Math.max(0, endAt.getTime() - Date.now());
